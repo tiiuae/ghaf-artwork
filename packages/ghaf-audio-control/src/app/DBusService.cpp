@@ -10,6 +10,8 @@
 #include <giomm/dbuserror.h>
 #include <giomm/dbusownname.h>
 
+#include <set>
+
 using namespace ghaf::AudioControl;
 
 namespace
@@ -26,6 +28,8 @@ constexpr auto UnsubscribeFromDeviceUpdatedSignal = "UnsubscribeFromDeviceUpdate
 
 constexpr auto SetDeviceVolume = "SetDeviceVolume";
 constexpr auto SetDeviceMute = "SetDeviceMute";
+
+constexpr auto MakeDeviceDefault = "MakeDeviceDefault";
 
 } // namespace MethodName
 
@@ -65,11 +69,11 @@ constexpr auto InterfaceName = "org.ghaf.Audio";
 
 } // namespace AudioControlService
 
-const auto IntrospectionXml = std::format(R"xml(
+constexpr auto IntrospectionXml = R"xml(
     <node>
         <interface name='org.ghaf.Audio'>
-            <method name='{}' />    <!-- Open -->
-            <method name='{}' />    <!-- Toggle -->
+            <method name='Open' />
+            <method name='Toggle' />
 
             <!--
                 Enum: DeviceType
@@ -86,10 +90,10 @@ const auto IntrospectionXml = std::format(R"xml(
                     - 2: Delete
             -->
 
-            <method name='{}' />    <!-- SubscribeToDeviceUpdatedSignal -->
-            <method name='{}' />    <!-- UnsubscribeFromDeviceUpdatedSignal -->
+            <method name='UnsubscribeFromDeviceUpdatedSignal' />
+            <method name='UnsubscribeFromDeviceUpdatedSignal' />
 
-            <method name='{}'>      <!-- SetDeviceVolume -->
+            <method name='SetDeviceVolume'>
                 <arg name='id' type='i' direction='in' />
                 <arg name='type' type='i' direction='in' />         <!-- See DeviceType enum -->
                 <arg name='volume' type='i' direction='in' />       <!-- min: 0, max: 100 -->
@@ -97,7 +101,7 @@ const auto IntrospectionXml = std::format(R"xml(
                 <arg name='result' type='i' direction='out' />      <!-- result 0 is OK, Error otherwise -->
             </method>
 
-            <method name='{}'>      <!-- SetDeviceMute -->
+            <method name='SetDeviceMute'>
                 <arg name='id' type='i' direction='in' />
                 <arg name='type' type='i' direction='in' />         <!-- See DeviceType enum -->
                 <arg name='mute' type='b' direction='in' />
@@ -105,12 +109,20 @@ const auto IntrospectionXml = std::format(R"xml(
                 <arg name='result' type='i' direction='out' />      <!-- result 0 is OK, Error otherwise -->
             </method>
 
-            <signal name='{}'>      <!-- DeviceUpdated -->
+            <method name='MakeDeviceDefault'>
+                <arg name='id' type='i' direction='in' />
+                <arg name='type' type='i' direction='in' />         <!-- See DeviceType enum. Only a Sink or a Source -->
+
+                <arg name='result' type='i' direction='out' />      <!-- result 0 is OK, Error otherwise -->
+            </method>
+
+            <signal name='DeviceUpdated'>
                 <arg name='id' type='i' />
                 <arg name='type' type='i' />                         <!-- See DeviceType enum -->
                 <arg name='name' type='s' />
                 <arg name='volume' type='i' />                       <!-- min: 0, max: 100 -->
                 <arg name='isMuted' type='b' />
+                <arg name='isDefault' type='b' />                    <!-- Makes sense only for a Sink and a Source -->
                 <arg name='event' type='i' />                        <!-- See EventType enum -->
             </signal>
         </interface>
@@ -129,12 +141,9 @@ const auto IntrospectionXml = std::format(R"xml(
             </method>
         </interface>
     </node>
-)xml",
-                                          MethodName::Open, MethodName::Toggle, MethodName::SubscribeToDeviceUpdatedSignal,
-                                          MethodName::UnsubscribeFromDeviceUpdatedSignal, MethodName::SetDeviceVolume, MethodName::SetDeviceMute,
-                                          SignalName::DeviceUpdated);
+)xml";
 
-DBusService::DeviceType intToDeviceType(int value)
+DBusService::DeviceType IntToDeviceType(int value)
 {
     switch (value)
     {
@@ -152,17 +161,17 @@ DBusService::DeviceType intToDeviceType(int value)
     }
 }
 
-int deviceTypeToInt(DBusService::DeviceType type)
+int DeviceTypeToInt(DBusService::DeviceType type)
 {
     return static_cast<int>(type);
 }
 
-auto createEmptyResponse()
+auto CreateEmptyResponse()
 {
     return Glib::VariantContainerBase::create_tuple(std::vector<Glib::VariantBase>{});
 };
 
-auto createResultOkResponse()
+auto CreateResultOkResponse()
 {
     return Glib::VariantContainerBase::create_tuple(Glib::Variant<int>::create(0));
 };
@@ -185,6 +194,8 @@ DBusService::DBusService()
 
         {MethodName::SetDeviceVolume, sigc::mem_fun(*this, &DBusService::onSetDeviceVolumeMethod)},
         {MethodName::SetDeviceMute, sigc::mem_fun(*this, &DBusService::onSetDeviceMuteMethod)},
+
+        {MethodName::MakeDeviceDefault, sigc::mem_fun(*this, &DBusService::onMakeDeviceDefaultMethod)},
     };
 }
 
@@ -193,14 +204,16 @@ DBusService::~DBusService()
     Gio::DBus::unown_name(m_connectionId);
 }
 
-void DBusService::sendDeviceInfo(DeviceIndex index, DeviceType type, const std::string& name, DeviceVolume volume, bool isMuted, DeviceEventType eventType)
+void DBusService::sendDeviceInfo(DeviceIndex index, DeviceType type, const std::string& name, DeviceVolume volume, bool isMuted, bool isDefault,
+                                 DeviceEventType eventType)
 {
     const Glib::VariantContainerBase args = Glib::VariantContainerBase::create_tuple({
         Glib::Variant<int>::create(index),                      // id
-        Glib::Variant<int>::create(deviceTypeToInt(type)),      // type
+        Glib::Variant<int>::create(DeviceTypeToInt(type)),      // type
         Glib::Variant<Glib::ustring>::create(name.c_str()),     // name
         Glib::Variant<int>::create(volume.getPercents()),       // volume
         Glib::Variant<bool>::create(isMuted),                   // isMuted
+        Glib::Variant<bool>::create(isDefault),                 // isDefault
         Glib::Variant<int>::create(static_cast<int>(eventType)) // event
     });
 
@@ -326,25 +339,25 @@ bool DBusService::onPropertySet([[maybe_unused]] const Glib::RefPtr<Gio::DBus::C
 DBusService::MethodResult DBusService::onOpenMethod([[maybe_unused]] const MethodParameters& parameters)
 {
     m_openSignal();
-    return createEmptyResponse();
+    return CreateEmptyResponse();
 }
 
 DBusService::MethodResult DBusService::onToggleMethod([[maybe_unused]] const MethodParameters& parameters)
 {
     m_toggleSignal();
-    return createEmptyResponse();
+    return CreateEmptyResponse();
 }
 
 DBusService::MethodResult DBusService::onSubscribeToDeviceUpdatedSignalMethod([[maybe_unused]] const MethodParameters& parameters)
 {
     m_subscribeToDeviceUpdatedSignal();
-    return createEmptyResponse();
+    return CreateEmptyResponse();
 }
 
 DBusService::MethodResult DBusService::onUnsubscribeFromDeviceUpdatedSignalMethod([[maybe_unused]] const MethodParameters& parameters)
 {
     // m_unsubscribeToDeviceUpdatedSignal();
-    return createEmptyResponse();
+    return CreateEmptyResponse();
 }
 
 DBusService::MethodResult DBusService::onSetDeviceVolumeMethod(const MethodParameters& parameters)
@@ -357,9 +370,9 @@ DBusService::MethodResult DBusService::onSetDeviceVolumeMethod(const MethodParam
     parameters.get_child(type, 1);
     parameters.get_child(volume, 2);
 
-    m_setDeviceVolumeSignal(id.get(), intToDeviceType(type.get()), Volume::fromPercents(static_cast<unsigned long>(volume.get())));
+    m_setDeviceVolumeSignal(id.get(), IntToDeviceType(type.get()), Volume::fromPercents(static_cast<unsigned long>(volume.get())));
 
-    return createResultOkResponse();
+    return CreateResultOkResponse();
 }
 
 DBusService::MethodResult DBusService::onSetDeviceMuteMethod(const MethodParameters& parameters)
@@ -372,7 +385,25 @@ DBusService::MethodResult DBusService::onSetDeviceMuteMethod(const MethodParamet
     parameters.get_child(type, 1);
     parameters.get_child(mute, 2);
 
-    m_setDeviceMuteSignal(id.get(), intToDeviceType(type.get()), mute.get());
+    m_setDeviceMuteSignal(id.get(), IntToDeviceType(type.get()), mute.get());
 
-    return createResultOkResponse();
+    return CreateResultOkResponse();
+}
+
+DBusService::MethodResult DBusService::onMakeDeviceDefaultMethod(const MethodParameters& parameters)
+{
+    Glib::Variant<int> id;
+    Glib::Variant<int> type;
+
+    parameters.get_child(id, 0);
+    parameters.get_child(type, 1);
+
+    const auto deviceType = IntToDeviceType(type.get());
+
+    if (!std::set{DBusService::DeviceType::Sink, DBusService::DeviceType::Source}.contains(deviceType))
+        throw std::runtime_error{std::format("'type' field has an unsupported value: {}. Only Sink and Source allowed", type.get())};
+
+    m_makeDeviceDefaultSignal(id.get(), deviceType);
+
+    return CreateResultOkResponse();
 }
